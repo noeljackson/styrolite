@@ -82,7 +82,8 @@ fn wait_for_pid(pid: libc::pid_t) -> Result<i32> {
 fn fork_and_wait() -> Result<()> {
     if let Err(e) = unsafe { signal::setup_parent_signal_handlers() } {
         warn!("unable to set up parent signal handlers: {e}");
-        process::exit(1)
+        // Use _exit to avoid running destructors/flushing buffers in forked process.
+        unsafe { libc::_exit(1) }
     }
 
     let pid = unsafe { libc::fork() };
@@ -93,12 +94,12 @@ fn fork_and_wait() -> Result<()> {
         debug!("[pid {pid}] exitcode = {exitcode}");
         debug!("reaping children of supervisor!");
         reap_children()?;
-        process::exit(exitcode);
+        unsafe { libc::_exit(exitcode) }
     }
 
     if let Err(e) = unsafe { signal::reset_child_signal_handlers() } {
         error!("Failed to reset child signal handlers: {e}");
-        process::exit(1);
+        unsafe { libc::_exit(1) }
     }
 
     Ok(())
@@ -506,12 +507,13 @@ impl Wrappable for CreateRequest {
         debug!("setting up parent signal handlers");
         if let Err(e) = unsafe { signal::setup_parent_signal_handlers() } {
             warn!("unable to set up parent signal handlers: {e}");
-            process::exit(1)
+            // Use _exit to avoid running destructors/flushing buffers in forked process.
+            unsafe { libc::_exit(1) }
         }
 
         debug!("all namespaces unshared -- forking child");
-        let parent_efd = unsafe { libc::eventfd(0, libc::EFD_SEMAPHORE) };
-        let child_efd = unsafe { libc::eventfd(0, libc::EFD_SEMAPHORE) };
+        let parent_efd = unsafe { libc::eventfd(0, libc::EFD_SEMAPHORE | libc::EFD_CLOEXEC) };
+        let child_efd = unsafe { libc::eventfd(0, libc::EFD_SEMAPHORE | libc::EFD_CLOEXEC) };
         let pid = unsafe { libc::fork() };
         if pid > 0 {
             signal::store_child_pid(pid);
@@ -538,12 +540,13 @@ impl Wrappable for CreateRequest {
             debug!("reaping children of supervisor!");
             reap_children()?;
 
-            process::exit(exitcode);
+            // Use _exit to avoid running destructors/flushing buffers in forked process.
+            unsafe { libc::_exit(exitcode) }
         }
 
         if let Err(e) = unsafe { signal::reset_child_signal_handlers() } {
             error!("Failed to reset child signal handlers: {e}");
-            process::exit(1);
+            unsafe { libc::_exit(1) }
         }
 
         let mut pef = unsafe { File::from_raw_fd(parent_efd) };
