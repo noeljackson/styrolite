@@ -82,7 +82,8 @@ fn wait_for_pid(pid: libc::pid_t) -> Result<i32> {
 fn fork_and_wait() -> Result<()> {
     if let Err(e) = unsafe { signal::setup_parent_signal_handlers() } {
         warn!("unable to set up parent signal handlers: {e}");
-        process::exit(1)
+        // Use _exit to avoid running destructors/flushing buffers in forked process.
+        unsafe { libc::_exit(1) }
     }
 
     let pid = unsafe { libc::fork() };
@@ -93,12 +94,12 @@ fn fork_and_wait() -> Result<()> {
         debug!("[pid {pid}] exitcode = {exitcode}");
         debug!("reaping children of supervisor!");
         reap_children()?;
-        process::exit(exitcode);
+        unsafe { libc::_exit(exitcode) }
     }
 
     if let Err(e) = unsafe { signal::reset_child_signal_handlers() } {
         error!("Failed to reset child signal handlers: {e}");
-        process::exit(1);
+        unsafe { libc::_exit(1) }
     }
 
     Ok(())
@@ -109,14 +110,42 @@ fn fork_and_wait() -> Result<()> {
 /// The reason we need this is because we actually need to attach to the
 /// *supervised* process, not the *supervisor* process, which exists in
 /// a different set of namespaces than the ones we want to attach to.
+///
+/// Tries `/proc/<pid>/task/<pid>/children` first (requires CONFIG_PROC_CHILDREN),
+/// then falls back to scanning `/proc` for processes whose PPid matches.
 fn first_child_pid_of(parent: libc::pid_t) -> Result<libc::pid_t> {
-    let child_set = fs::read_to_string(format!("/proc/{parent}/task/{parent}/children"))?;
-    let first_child = child_set.split(" ").collect::<Vec<_>>()[0];
-
-    match first_child.parse::<libc::pid_t>() {
-        Ok(v) => Ok(v),
-        _ => Err(anyhow!("failed to find child PID")),
+    // Fast path: use the children file if available (CONFIG_PROC_CHILDREN=y).
+    let children_path = format!("/proc/{parent}/task/{parent}/children");
+    if let Ok(child_set) = fs::read_to_string(&children_path) {
+        let first_child = child_set.split(' ').next().unwrap_or("");
+        if let Ok(v) = first_child.parse::<libc::pid_t>() {
+            return Ok(v);
+        }
     }
+
+    // Fallback: scan /proc for a process whose PPid matches parent.
+    let ppid_needle = format!("PPid:\t{parent}");
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Only look at numeric directories (PIDs).
+        if !name_str.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+            continue;
+        }
+        let status_path = format!("/proc/{name_str}/status");
+        if let Ok(status) = fs::read_to_string(&status_path) {
+            if status.lines().any(|line| line == ppid_needle) {
+                if let Ok(pid) = name_str.parse::<libc::pid_t>() {
+                    return Ok(pid);
+                }
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "failed to find child PID of {parent} (no children file, /proc scan found nothing)"
+    ))
 }
 
 fn render_uidgid_mappings(mappings: &[IdMapping]) -> String {
@@ -322,6 +351,7 @@ impl CreateRequest {
             safe: false,
             create_mountpoint: false,
             read_only: false,
+            data: None,
         };
 
         oldroot
@@ -346,6 +376,7 @@ impl CreateRequest {
                 safe: true,
                 create_mountpoint: true,
                 read_only: false,
+                data: None,
             };
             stage_tmpfs.mount().expect("failed to mount staging tmpfs");
 
@@ -362,6 +393,7 @@ impl CreateRequest {
                 safe: false,
                 create_mountpoint: false,
                 read_only: false,
+                data: None,
             };
             stage_bind
                 .mount()
@@ -381,9 +413,25 @@ impl CreateRequest {
             safe: false,
             create_mountpoint: false,
             read_only: false,
+            data: None,
         };
 
         newroot.mount().expect("failed to bind new rootfs");
+
+        // Harden rootfs: add NOSUID + NODEV without NOEXEC (binaries must execute).
+        // The `safe` flag on MountSpec adds all three, so we use mount_setattr directly.
+        {
+            let mut attr: libc::mount_attr = unsafe { std::mem::zeroed() };
+            attr.attr_set =
+                (libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV) as u64;
+            crate::mount::mount_setattr(
+                libc::AT_FDCWD,
+                &rootfs,
+                libc::AT_RECURSIVE as libc::c_uint,
+                &attr,
+            )
+            .expect("failed to set nosuid+nodev on rootfs");
+        }
 
         if rootfs_readonly {
             newroot.seal().expect("failed to make new rootfs readonly");
@@ -400,6 +448,7 @@ impl CreateRequest {
             safe: true,
             create_mountpoint: false,
             read_only: false,
+            data: None,
         };
 
         procfs.mount().expect("failed to mount /proc");
@@ -417,11 +466,19 @@ impl CreateRequest {
                     safe: mount.safe,
                     create_mountpoint: mount.create_mountpoint,
                     read_only: mount.read_only,
+                    data: mount.data.clone(),
                 };
 
-                parented_mount
-                    .mount()
-                    .expect("failed to process mount spec");
+                if let Err(e) = parented_mount.mount() {
+                    warn!(
+                        "mount failed: source={:?} target={:?} fstype={:?}: {e}",
+                        mount.source, mount.target, mount.fstype
+                    );
+                    // Only fatal for essential mounts (tmpfs /dev hides hvc0).
+                    if mount.target == "/dev" && !mount.bind {
+                        return Err(e.context("essential mount /dev failed"));
+                    }
+                }
             }
         }
 
@@ -506,12 +563,13 @@ impl Wrappable for CreateRequest {
         debug!("setting up parent signal handlers");
         if let Err(e) = unsafe { signal::setup_parent_signal_handlers() } {
             warn!("unable to set up parent signal handlers: {e}");
-            process::exit(1)
+            // Use _exit to avoid running destructors/flushing buffers in forked process.
+            unsafe { libc::_exit(1) }
         }
 
         debug!("all namespaces unshared -- forking child");
-        let parent_efd = unsafe { libc::eventfd(0, libc::EFD_SEMAPHORE) };
-        let child_efd = unsafe { libc::eventfd(0, libc::EFD_SEMAPHORE) };
+        let parent_efd = unsafe { libc::eventfd(0, libc::EFD_SEMAPHORE | libc::EFD_CLOEXEC) };
+        let child_efd = unsafe { libc::eventfd(0, libc::EFD_SEMAPHORE | libc::EFD_CLOEXEC) };
         let pid = unsafe { libc::fork() };
         if pid > 0 {
             signal::store_child_pid(pid);
@@ -538,12 +596,13 @@ impl Wrappable for CreateRequest {
             debug!("reaping children of supervisor!");
             reap_children()?;
 
-            process::exit(exitcode);
+            // Use _exit to avoid running destructors/flushing buffers in forked process.
+            unsafe { libc::_exit(exitcode) }
         }
 
         if let Err(e) = unsafe { signal::reset_child_signal_handlers() } {
             error!("Failed to reset child signal handlers: {e}");
-            process::exit(1);
+            unsafe { libc::_exit(1) }
         }
 
         let mut pef = unsafe { File::from_raw_fd(parent_efd) };
@@ -628,6 +687,17 @@ impl ExecutableSpec {
             self.set_no_new_privs()?;
         }
 
+        // Install seccomp-bpf filter if provided.
+        // Must be after set_no_new_privs (required for unprivileged seccomp)
+        // and before execvpe (filter applies to the exec'd process).
+        if let Some(ref seccomp) = self.seccomp {
+            unsafe {
+                if let Err(e) = seccomp.install() {
+                    bail!("failed to install seccomp filter: {e}");
+                }
+            }
+        }
+
         unsafe {
             if libc::execvpe(
                 program_cstring.as_ptr(),
@@ -635,7 +705,8 @@ impl ExecutableSpec {
                 env_charptrs.as_ptr(),
             ) < 0
             {
-                Err(anyhow!("execvpe failed"))
+                let err = Error::last_os_error();
+                Err(anyhow!("execvpe({:?}) failed: {}", self.executable, err))
             } else {
                 Ok(())
             }
