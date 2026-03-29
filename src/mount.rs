@@ -185,10 +185,28 @@ impl Mountable for MountSpec {
             flags |= libc::MS_REC;
         }
 
+        let data_cstr = self
+            .data
+            .as_ref()
+            .map(|d| CString::new(d.as_str()).unwrap());
+        let data_ptr = data_cstr
+            .as_ref()
+            .map(|c| c.as_ptr() as *const libc::c_void)
+            .unwrap_or(ptr::null());
+
         unsafe {
-            let rc = libc::mount(source_p, target_p, fstype_p, flags, ptr::null());
+            let rc = libc::mount(source_p, target_p, fstype_p, flags, data_ptr);
             if rc < 0 {
-                bail!("unable to mount");
+                let err = io::Error::last_os_error();
+                bail!(
+                    "unable to mount: source={:?} target={:?} fstype={:?} bind={} flags=0x{:x}: {}",
+                    self.source,
+                    self.target,
+                    self.fstype,
+                    self.bind,
+                    flags,
+                    err
+                );
             }
         }
 
@@ -196,8 +214,10 @@ impl Mountable for MountSpec {
 
         if self.safe {
             set |= libc::MOUNT_ATTR_NOSUID as c_ulong;
-            set |= libc::MOUNT_ATTR_NODEV as c_ulong;
             set |= libc::MOUNT_ATTR_NOEXEC as c_ulong;
+            if self.fstype.as_deref() != Some("devpts") {
+                set |= libc::MOUNT_ATTR_NODEV as c_ulong;
+            }
         }
 
         if self.read_only {

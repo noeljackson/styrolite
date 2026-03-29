@@ -2,15 +2,22 @@ use crate::caps::CapabilityBit;
 use crate::namespace::Namespace;
 use crate::seccomp::SeccompFilter;
 use anyhow::{Result, bail};
-use libc::{gid_t, pid_t, uid_t};
+use libc::{c_int, gid_t, pid_t, uid_t};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::str::FromStr;
 
 #[derive(Default, Debug, Serialize, Deserialize)]
 pub struct AttachRequest {
     /// The PID to join in the namespace.
     pub pid: pid_t,
+
+    /// When true, `pid` is already the exact target process whose namespaces
+    /// should be joined. When false, attach resolves the first child of `pid`
+    /// (or falls back to `pid` if no visible child exists).
+    #[serde(default)]
+    pub pid_is_target: bool,
 
     /// The executable specification for the new process created in this
     /// container.
@@ -142,6 +149,13 @@ pub struct CreateRequest {
 
     /// Whether the two-stage userns setup should be skipped.
     pub skip_two_stage_userns: Option<bool>,
+
+    /// Optional file descriptor in the supervisor process where the PID of the
+    /// initial workload child should be reported as a native-endian `i32`.
+    ///
+    /// This lets callers persist the real attach target PID without guessing
+    /// later via `/proc` topology.
+    pub workload_pid_report_fd: Option<c_int>,
 }
 
 #[derive(Default, Debug, Serialize, Deserialize)]
@@ -257,6 +271,9 @@ pub struct MountSpec {
 
     /// Whether the mount point should be mounted readonly.
     pub read_only: bool,
+
+    /// Optional mount data (e.g., "size=64m" for tmpfs).
+    pub data: Option<String>,
 }
 
 pub trait Mountable {
@@ -278,69 +295,83 @@ pub trait Mutatable {
 }
 
 /// Resource limits for processes inside the container itself.
-/// If a value is not set, the resource limit will be disabled by setting it
-/// to unlimited.
+/// Each limit can be left unchanged, set to a concrete value, or set to
+/// unlimited explicitly.
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
 pub struct ProcessResourceLimits {
     /// The maximum size in bytes for container processes to use as virtual address
     /// space.  See RLIMIT_AS in setrlimit(2) for more detail.
-    pub address_space_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "ProcessResourceLimitValue::is_keep")]
+    pub address_space_size: ProcessResourceLimitValue,
 
     /// The maximum size in bytes for any core file created when a container process
     /// terminates from crashing.  See RLIMIT_CORE in setrlimit(2) for more detail.
-    pub core_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "ProcessResourceLimitValue::is_keep")]
+    pub core_size: ProcessResourceLimitValue,
 
     /// The maximum amount of CPU seconds a process can consume before a process is
     /// terminated.  See RLIMIT_CPU in setrlimit(2) for more detail.
-    pub cpu_time: Option<u64>,
+    #[serde(default, skip_serializing_if = "ProcessResourceLimitValue::is_keep")]
+    pub cpu_time: ProcessResourceLimitValue,
 
     /// The maximum amount of heap memory that a process can consume before further
     /// heap allocations fail.  See RLIMIT_DATA in setrlimit(2) for more detail.
-    pub data_space_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "ProcessResourceLimitValue::is_keep")]
+    pub data_space_size: ProcessResourceLimitValue,
 
     /// The maximum amount of written bytes to disk that a process can write before
     /// further writes fail.  See RLIMIT_FSIZE in setrlimit(2) for more detail.
-    pub file_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "ProcessResourceLimitValue::is_keep")]
+    pub file_size: ProcessResourceLimitValue,
 
     /// The maximum amount, in bytes, of memory pages which can be locked by a process.
     /// This value is rounded down to the nearest page size boundary.
     /// See RLIMIT_MEMLOCK in setrlimit(2) for more detail.
-    pub locked_space_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "ProcessResourceLimitValue::is_keep")]
+    pub locked_space_size: ProcessResourceLimitValue,
 
     /// The maximum amount, in bytes, of memory pages which can be allocated for POSIX
     /// message queues.  The value is rounded down to the nearest page size boundary.
     /// See RLIMIT_MSGQUEUE in setrlimit(2) for more detail.
-    pub msgqueue_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "ProcessResourceLimitValue::is_keep")]
+    pub msgqueue_size: ProcessResourceLimitValue,
 
     /// The maximum niceness level ceiling for a given process.  The calculated value
     /// inside the kernel starts at 20 and is subtracted by the supplied ceiling value.
     /// See RLIMIT_NICE in setrlimit(2) for more detail.
-    pub nice_ceiling: Option<u64>,
+    #[serde(default, skip_serializing_if = "ProcessResourceLimitValue::is_keep")]
+    pub nice_ceiling: ProcessResourceLimitValue,
 
     /// The maximum number of open file descriptors for processes inside the container.
     /// See RLIMIT_NOFILE in setrlimit(2) for more detail.
-    pub open_files: Option<u64>,
+    #[serde(default, skip_serializing_if = "ProcessResourceLimitValue::is_keep")]
+    pub open_files: ProcessResourceLimitValue,
 
     /// The maximum number of threads/LWPs which can be a child of a given process.
     /// See RLIMIT_NPROC in setrlimit(2) for more detail.
-    pub thread_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "ProcessResourceLimitValue::is_keep")]
+    pub thread_limit: ProcessResourceLimitValue,
 
     /// The maximum amount of resident memory allowed for a given process.
     /// See RLIMIT_RSS in setrlimit(2) for more detail.
-    pub resident_space_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "ProcessResourceLimitValue::is_keep")]
+    pub resident_space_size: ProcessResourceLimitValue,
 
     /// The maximum realtime niceness level ceiling for a given process.
     /// See RLIMIT_RTPRIO in setrlimit(2) for more detail.
-    pub real_time_priority: Option<u64>,
+    #[serde(default, skip_serializing_if = "ProcessResourceLimitValue::is_keep")]
+    pub real_time_priority: ProcessResourceLimitValue,
 
     /// The maximum amount of CPU microseconds a process may spend before making
     /// a blocking syscall or otherwise being preempted by the kernel scheduler.
     /// See RLIMIT_RTTIME in setrlimit(2) for more detail.
-    pub real_time_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "ProcessResourceLimitValue::is_keep")]
+    pub real_time_limit: ProcessResourceLimitValue,
 
     /// The maximum number of pending signals that can be delivered to a process
     /// at any time.  See RLIMIT_SIGPENDING in setrlimit(2) for more detail.
-    pub pending_signal_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "ProcessResourceLimitValue::is_keep")]
+    pub pending_signal_limit: ProcessResourceLimitValue,
 
     /// The stack size that should be used for the main thread's stack when creating
     /// new processes.  On Linux, this normally defaults to 8MB, although the stack
@@ -348,5 +379,178 @@ pub struct ProcessResourceLimits {
     /// to an 8MB limit for secondary threads, while musl defaults to 80KB unless a
     /// different stack size annotation is present on the binary being run.
     /// See RLIMIT_STACK in setrlimit(2) for more detail.
-    pub main_thread_stack_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "ProcessResourceLimitValue::is_keep")]
+    pub main_thread_stack_size: ProcessResourceLimitValue,
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub enum ProcessResourceLimitValue {
+    #[default]
+    Keep,
+    Value(u64),
+    Unlimited,
+}
+
+impl ProcessResourceLimitValue {
+    pub const fn keep() -> Self {
+        Self::Keep
+    }
+
+    pub const fn value(value: u64) -> Self {
+        Self::Value(value)
+    }
+
+    pub const fn unlimited() -> Self {
+        Self::Unlimited
+    }
+
+    pub const fn is_keep(&self) -> bool {
+        matches!(self, Self::Keep)
+    }
+}
+
+impl Serialize for ProcessResourceLimitValue {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Keep => serializer.serialize_none(),
+            Self::Value(value) => serializer.serialize_u64(*value),
+            Self::Unlimited => serializer.serialize_str("unlimited"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProcessResourceLimitValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = ProcessResourceLimitValue;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a u64, \"unlimited\", or null")
+            }
+
+            fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(ProcessResourceLimitValue::Keep)
+            }
+
+            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(ProcessResourceLimitValue::Keep)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                Deserialize::deserialize(deserializer)
+            }
+
+            fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(ProcessResourceLimitValue::Value(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value < 0 {
+                    return Err(E::custom("resource limit must be non-negative"));
+                }
+                Ok(ProcessResourceLimitValue::Value(value as u64))
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                ProcessResourceLimitValue::from_str(value).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(&value)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+impl FromStr for ProcessResourceLimitValue {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "unlimited" => Ok(Self::Unlimited),
+            other => other
+                .parse::<u64>()
+                .map(Self::Value)
+                .map_err(|_| format!("invalid process resource limit value: {other}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProcessResourceLimitValue, ProcessResourceLimits};
+
+    #[test]
+    fn process_resource_limit_value_round_trips() {
+        assert_eq!(
+            serde_json::from_str::<ProcessResourceLimitValue>("123").unwrap(),
+            ProcessResourceLimitValue::value(123)
+        );
+        assert_eq!(
+            serde_json::from_str::<ProcessResourceLimitValue>("\"unlimited\"").unwrap(),
+            ProcessResourceLimitValue::unlimited()
+        );
+        assert_eq!(
+            serde_json::from_str::<ProcessResourceLimitValue>("null").unwrap(),
+            ProcessResourceLimitValue::keep()
+        );
+        assert_eq!(
+            serde_json::to_string(&ProcessResourceLimitValue::value(99)).unwrap(),
+            "99"
+        );
+        assert_eq!(
+            serde_json::to_string(&ProcessResourceLimitValue::unlimited()).unwrap(),
+            "\"unlimited\""
+        );
+    }
+
+    #[test]
+    fn process_resource_limits_skip_keep_fields() {
+        let limits = ProcessResourceLimits {
+            open_files: ProcessResourceLimitValue::value(1024),
+            core_size: ProcessResourceLimitValue::value(0),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&limits).unwrap();
+        assert!(json.contains("\"open_files\":1024"));
+        assert!(json.contains("\"core_size\":0"));
+        assert!(!json.contains("address_space_size"));
+
+        let decoded: ProcessResourceLimits = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.open_files, ProcessResourceLimitValue::value(1024));
+        assert_eq!(decoded.core_size, ProcessResourceLimitValue::value(0));
+        assert_eq!(decoded.address_space_size, ProcessResourceLimitValue::keep());
+    }
 }
