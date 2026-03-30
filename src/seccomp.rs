@@ -12,7 +12,10 @@ pub struct SeccompFilter {
 }
 
 impl SeccompFilter {
-    /// Install the seccomp filter via `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)`.
+    /// Install the seccomp filter via `seccomp(2)` with `SECCOMP_FILTER_FLAG_TSYNC`.
+    ///
+    /// Uses `seccomp(2)` instead of `prctl(PR_SET_SECCOMP)` to synchronize the
+    /// filter across all threads via `SECCOMP_FILTER_FLAG_TSYNC`.
     ///
     /// # Safety
     ///
@@ -28,12 +31,18 @@ impl SeccompFilter {
             len: filters.len() as u16,
             filter: filters.as_ptr() as *mut _,
         };
-        if libc::prctl(
-            libc::PR_SET_SECCOMP,
-            2, // SECCOMP_MODE_FILTER
-            &prog as *const _ as libc::c_ulong,
-        ) != 0
-        {
+
+        // Use seccomp(2) with TSYNC to synchronize filter across all threads.
+        // SECCOMP_SET_MODE_FILTER = 1, SECCOMP_FILTER_FLAG_TSYNC = 1
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                1u64, // SECCOMP_SET_MODE_FILTER
+                1u64, // SECCOMP_FILTER_FLAG_TSYNC
+                &prog as *const _,
+            )
+        };
+        if ret != 0 {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())

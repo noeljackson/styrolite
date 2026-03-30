@@ -13,7 +13,7 @@ use crate::caps::{CapabilityBit, get_caps, set_caps, set_keep_caps};
 use crate::cgroup::CGroup;
 use crate::config::{
     AttachRequest, Capabilities, CreateDirMutation, CreateRequest, ExecutableSpec, IdMapping,
-    MountSpec, Mountable, Mutatable, Mutation, Wrappable,
+    MountSpec, Mountable, Mutatable, Mutation, ProcessResourceLimitValue, Wrappable,
 };
 use crate::namespace::Namespace;
 use crate::signal;
@@ -37,11 +37,11 @@ type RLimit = libc::__rlimit_resource_t;
 #[cfg(not(target_env = "gnu"))]
 type RLimit = libc::c_int;
 
-fn set_process_limit(resource: RLimit, limit: Option<u64>) -> Result<()> {
-    let unpacked_limit = if let Some(rl) = limit {
-        rl
-    } else {
-        libc::RLIM_INFINITY
+fn set_process_limit(resource: RLimit, limit: ProcessResourceLimitValue) -> Result<()> {
+    let unpacked_limit = match limit {
+        ProcessResourceLimitValue::Keep => return Ok(()),
+        ProcessResourceLimitValue::Value(rl) => rl,
+        ProcessResourceLimitValue::Unlimited => libc::RLIM_INFINITY,
     };
 
     let rlimit = libc::rlimit {
@@ -105,18 +105,123 @@ fn fork_and_wait() -> Result<()> {
     Ok(())
 }
 
+fn close_optional_fd(fd: Option<c_int>) {
+    if let Some(fd) = fd {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
+fn mask_self_proc_mem() -> Result<()> {
+    unsafe {
+        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+            bail!(
+                "failed to set dumpable=0 before /proc/self/mem mask: {}",
+                Error::last_os_error()
+            );
+        }
+    }
+
+    let proc_mem = format!("/proc/{}/mem", process::id());
+    let devnull = CString::new("/dev/null")?;
+    let proc_mem_c = CString::new(proc_mem)?;
+    let rc = unsafe {
+        libc::mount(
+            devnull.as_ptr(),
+            proc_mem_c.as_ptr(),
+            ptr::null(),
+            libc::MS_BIND as libc::c_ulong,
+            ptr::null(),
+        )
+    };
+    if rc != 0 {
+        bail!(
+            "failed to bind-mount /dev/null over /proc/self/mem: {}",
+            Error::last_os_error()
+        );
+    }
+
+    Ok(())
+}
+
+fn create_diag(line: &str) {
+    let mut owned = line.as_bytes().to_vec();
+    if !owned.ends_with(b"\n") {
+        owned.push(b'\n');
+    }
+    unsafe {
+        libc::write(2, owned.as_ptr() as *const _, owned.len());
+    }
+}
+
 /// Find the first child PID of the given parent process.
 ///
 /// The reason we need this is because we actually need to attach to the
 /// *supervised* process, not the *supervisor* process, which exists in
 /// a different set of namespaces than the ones we want to attach to.
+///
+/// Tries `/proc/<pid>/task/<pid>/children` first (requires CONFIG_PROC_CHILDREN),
+/// then falls back to scanning `/proc` for processes whose PPid matches.
 fn first_child_pid_of(parent: libc::pid_t) -> Result<libc::pid_t> {
-    let child_set = fs::read_to_string(format!("/proc/{parent}/task/{parent}/children"))?;
-    let first_child = child_set.split(" ").collect::<Vec<_>>()[0];
+    // Fast path: use the children file if available (CONFIG_PROC_CHILDREN=y).
+    let children_path = format!("/proc/{parent}/task/{parent}/children");
+    if let Ok(child_set) = fs::read_to_string(&children_path) {
+        let first_child = child_set.split(' ').next().unwrap_or("");
+        if let Ok(v) = first_child.parse::<libc::pid_t>() {
+            return Ok(v);
+        }
+    }
 
-    match first_child.parse::<libc::pid_t>() {
-        Ok(v) => Ok(v),
-        _ => Err(anyhow!("failed to find child PID")),
+    // Fallback: scan /proc for a process whose PPid matches parent.
+    let ppid_needle = format!("PPid:\t{parent}");
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Only look at numeric directories (PIDs).
+        if !name_str
+            .chars()
+            .next()
+            .map_or(false, |c| c.is_ascii_digit())
+        {
+            continue;
+        }
+        let status_path = format!("/proc/{name_str}/status");
+        if let Ok(status) = fs::read_to_string(&status_path) {
+            if status.lines().any(|line| line == ppid_needle) {
+                if let Ok(pid) = name_str.parse::<libc::pid_t>() {
+                    return Ok(pid);
+                }
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "failed to find child PID of {parent} (no children file, /proc scan found nothing)"
+    ))
+}
+
+fn pid_is_alive(pid: libc::pid_t) -> bool {
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+
+    matches!(Error::last_os_error().raw_os_error(), Some(libc::EPERM))
+}
+
+fn attach_target_pid_of(parent: libc::pid_t) -> Result<libc::pid_t> {
+    match first_child_pid_of(parent) {
+        Ok(pid) => Ok(pid),
+        Err(child_err) => {
+            if pid_is_alive(parent) {
+                warn!("no visible child under pid {parent}, attaching directly to configured pid");
+                Ok(parent)
+            } else {
+                Err(child_err)
+            }
+        }
     }
 }
 
@@ -134,6 +239,32 @@ fn render_uidgid_mappings(mappings: &[IdMapping]) -> String {
 }
 
 impl CreateRequest {
+    fn report_workload_pid(&self, pid: libc::pid_t) -> Result<()> {
+        let Some(fd) = self.workload_pid_report_fd else {
+            return Ok(());
+        };
+
+        let bytes = pid.to_ne_bytes();
+        let rc = unsafe { libc::write(fd, bytes.as_ptr() as *const _, bytes.len()) };
+        let write_err = if rc < 0 {
+            Some(Error::last_os_error())
+        } else if rc as usize != bytes.len() {
+            Some(Error::other("short write when reporting workload pid"))
+        } else {
+            None
+        };
+
+        unsafe {
+            libc::close(fd);
+        }
+
+        if let Some(err) = write_err {
+            Err(anyhow!("failed to report workload pid: {err}"))
+        } else {
+            Ok(())
+        }
+    }
+
     fn get_boottime(&self) -> i64 {
         unsafe {
             let mut ts: MaybeUninit<libc::timespec> = MaybeUninit::uninit();
@@ -323,6 +454,7 @@ impl CreateRequest {
             safe: false,
             create_mountpoint: false,
             read_only: false,
+            data: None,
         };
 
         oldroot
@@ -347,6 +479,7 @@ impl CreateRequest {
                 safe: true,
                 create_mountpoint: true,
                 read_only: false,
+                data: None,
             };
             stage_tmpfs.mount().expect("failed to mount staging tmpfs");
 
@@ -363,6 +496,7 @@ impl CreateRequest {
                 safe: false,
                 create_mountpoint: false,
                 read_only: false,
+                data: None,
             };
             stage_bind
                 .mount()
@@ -382,9 +516,24 @@ impl CreateRequest {
             safe: false,
             create_mountpoint: false,
             read_only: false,
+            data: None,
         };
 
         newroot.mount().expect("failed to bind new rootfs");
+
+        // Harden rootfs: add NOSUID + NODEV without NOEXEC (binaries must execute).
+        // The `safe` flag on MountSpec adds all three, so we use mount_setattr directly.
+        {
+            let mut attr: libc::mount_attr = unsafe { std::mem::zeroed() };
+            attr.attr_set = (libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV) as u64;
+            crate::mount::mount_setattr(
+                libc::AT_FDCWD,
+                &rootfs,
+                libc::AT_RECURSIVE as libc::c_uint,
+                &attr,
+            )
+            .expect("failed to set nosuid+nodev on rootfs");
+        }
 
         if rootfs_readonly {
             newroot.seal().expect("failed to make new rootfs readonly");
@@ -401,6 +550,7 @@ impl CreateRequest {
             safe: true,
             create_mountpoint: false,
             read_only: false,
+            data: None,
         };
 
         procfs.mount().expect("failed to mount /proc");
@@ -418,11 +568,19 @@ impl CreateRequest {
                     safe: mount.safe,
                     create_mountpoint: mount.create_mountpoint,
                     read_only: mount.read_only,
+                    data: mount.data.clone(),
                 };
 
-                parented_mount
-                    .mount()
-                    .expect("failed to process mount spec");
+                if let Err(e) = parented_mount.mount() {
+                    warn!(
+                        "mount failed: source={:?} target={:?} fstype={:?}: {e}",
+                        mount.source, mount.target, mount.fstype
+                    );
+                    // Only fatal for essential mounts (tmpfs /dev hides hvc0).
+                    if mount.target == "/dev" && !mount.bind {
+                        return Err(e.context("essential mount /dev failed"));
+                    }
+                }
             }
         }
 
@@ -470,6 +628,7 @@ impl Wrappable for CreateRequest {
             "maybe create a new supervisor cgroup for workload identity {}",
             self.identity()?
         );
+        create_diag("styrolite: create wrap entered");
         if let Err(e) = self.prepare_cgroup() {
             warn!("unable to prepare cgroup: {e}");
         }
@@ -488,6 +647,7 @@ impl Wrappable for CreateRequest {
 
         debug!("unsharing namespaces");
         unshare(&first_level_ns)?;
+        create_diag("styrolite: first-level namespaces unshared");
 
         debug!("update boot time");
         if self.update_boottime().is_err() {
@@ -512,11 +672,21 @@ impl Wrappable for CreateRequest {
         }
 
         debug!("all namespaces unshared -- forking child");
+        create_diag("styrolite: about to fork initial workload child");
         let parent_efd = unsafe { libc::eventfd(0, libc::EFD_SEMAPHORE | libc::EFD_CLOEXEC) };
         let child_efd = unsafe { libc::eventfd(0, libc::EFD_SEMAPHORE | libc::EFD_CLOEXEC) };
         let pid = unsafe { libc::fork() };
         if pid > 0 {
             signal::store_child_pid(pid);
+            create_diag(&format!(
+                "styrolite: supervisor forked workload child pid={pid}"
+            ));
+
+            if let Err(e) = self.report_workload_pid(pid) {
+                warn!("unable to report initial workload pid {pid}: {e}");
+            } else {
+                create_diag(&format!("styrolite: reported workload pid={pid}"));
+            }
 
             debug!("child pid = {pid}");
             let mut pef = unsafe { File::from_raw_fd(parent_efd) };
@@ -544,6 +714,8 @@ impl Wrappable for CreateRequest {
             unsafe { libc::_exit(exitcode) }
         }
 
+        close_optional_fd(self.workload_pid_report_fd);
+
         if let Err(e) = unsafe { signal::reset_child_signal_handlers() } {
             error!("Failed to reset child signal handlers: {e}");
             unsafe { libc::_exit(1) }
@@ -555,6 +727,7 @@ impl Wrappable for CreateRequest {
             debug!("unsharing user namespace");
             unshare(&vec![Namespace::User])?;
         }
+        create_diag("styrolite: inner child waiting for supervisor handshake");
 
         debug!("signalling supervisor to do configuration");
         pef.write_all(&2_u64.to_ne_bytes())?;
@@ -565,10 +738,12 @@ impl Wrappable for CreateRequest {
         let mut cef = unsafe { File::from_raw_fd(child_efd) };
         let mut buf = [0u8; 8];
         cef.read_exact(&mut buf)?;
+        create_diag("styrolite: inner child handshake complete");
 
         // We are configured, now do the mount stuff?
         if target_ns.contains(&Namespace::Mount) {
             self.pivot_fs()?;
+            create_diag("styrolite: pivot_fs complete");
         } else {
             warn!("mount namespace not present in requested namespaces, trying to work anyway...");
             warn!("this is an insecure configuration!");
@@ -588,6 +763,7 @@ impl Wrappable for CreateRequest {
         apply_capabilities(self.capabilities.as_ref())?;
 
         debug!("ready to launch workload");
+        create_diag("styrolite: executing initial workload");
         self.exec.execute()
     }
 }
@@ -649,7 +825,8 @@ impl ExecutableSpec {
                 env_charptrs.as_ptr(),
             ) < 0
             {
-                Err(anyhow!("execvpe failed"))
+                let err = Error::last_os_error();
+                Err(anyhow!("execvpe({:?}) failed: {}", self.executable, err))
             } else {
                 Ok(())
             }
@@ -758,7 +935,11 @@ impl Wrappable for AttachRequest {
 
         debug!("namespaces: {target_ns:?}");
 
-        let target_pid = first_child_pid_of(self.pid)?;
+        let target_pid = if self.pid_is_target {
+            self.pid
+        } else {
+            attach_target_pid_of(self.pid)?
+        };
 
         debug!(
             "maybe attach to a pre-existing supervisor cgroup for workload identity {}",
@@ -771,15 +952,38 @@ impl Wrappable for AttachRequest {
         debug!("determined that we want to use the namespaces of host PID {target_pid}");
         setns(target_pid, &target_ns)?;
 
+        // After joining the target mount namespace, our root/cwd still refer to
+        // the old zone mount tree. Re-anchor to "/" inside the joined mount
+        // namespace so absolute path lookups resolve within the container root.
+        unsafe {
+            if libc::chroot(c"/".as_ptr()) != 0 {
+                bail!(
+                    "failed to chroot(\"/\") after setns: {}",
+                    Error::last_os_error()
+                );
+            }
+            if libc::chdir(c"/".as_ptr()) != 0 {
+                bail!(
+                    "failed to chdir(\"/\") after setns: {}",
+                    Error::last_os_error()
+                );
+            }
+        }
+        env::set_current_dir("/")?;
+
         debug!("setting process limits");
         if self.exec.set_process_limits().is_err() {
             warn!("unable to set process limits");
         }
 
-        apply_capabilities(self.capabilities.as_ref())?;
-
         debug!("all namespaces joined -- forking child");
         fork_and_wait()?;
+
+        mask_self_proc_mem()?;
+
+        set_keep_caps()?;
+        apply_gid_uid(self.exec.gid, self.exec.uid)?;
+        apply_capabilities(self.capabilities.as_ref())?;
 
         self.exec.execute()
     }
