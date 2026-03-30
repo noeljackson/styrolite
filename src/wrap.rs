@@ -1,10 +1,8 @@
 use std::env;
 use std::ffi::CString;
 use std::fs;
-use std::fs::File;
-use std::io::{Error, Read, Write};
+use std::io::Error;
 use std::mem::MaybeUninit;
-use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::process;
 use std::ptr;
@@ -23,6 +21,9 @@ use libc::{
     self, PR_CAP_AMBIENT, PR_CAP_AMBIENT_LOWER, PR_CAP_AMBIENT_RAISE, PR_CAPBSET_DROP,
     PR_SET_NO_NEW_PRIVS, c_int, prctl,
 };
+use nix::sys::eventfd::{EfdFlags, EventFd};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::unistd::{ForkResult, Pid, fork};
 
 use log::{debug, error, warn};
 
@@ -59,24 +60,20 @@ fn set_process_limit(resource: RLimit, limit: ProcessResourceLimitValue) -> Resu
 }
 
 fn reap_children() -> Result<()> {
-    while unsafe { libc::waitpid(-1, ptr::null_mut(), libc::WNOHANG) } > 0 {}
-
+    loop {
+        match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) | Err(_) => break,
+            _ => {}
+        }
+    }
     Ok(())
 }
 
 fn wait_for_pid(pid: libc::pid_t) -> Result<i32> {
-    let status = unsafe {
-        let mut st: MaybeUninit<i32> = MaybeUninit::uninit();
-
-        if libc::waitpid(pid, st.as_mut_ptr(), 0) < 0 {
-            panic!("waitpid of child process failed");
-        }
-
-        st.assume_init()
-    };
-
-    let exitcode = libc::WEXITSTATUS(status);
-    Ok(exitcode)
+    match waitpid(Pid::from_raw(pid), None)? {
+        WaitStatus::Exited(_, code) => Ok(code),
+        _ => Ok(1),
+    }
 }
 
 fn fork_and_wait() -> Result<()> {
@@ -86,15 +83,17 @@ fn fork_and_wait() -> Result<()> {
         unsafe { libc::_exit(1) }
     }
 
-    let pid = unsafe { libc::fork() };
-    if pid > 0 {
-        signal::store_child_pid(pid);
-        debug!("child pid = {pid}");
-        let exitcode = wait_for_pid(pid)?;
-        debug!("[pid {pid}] exitcode = {exitcode}");
-        debug!("reaping children of supervisor!");
-        reap_children()?;
-        unsafe { libc::_exit(exitcode) }
+    match unsafe { fork() }? {
+        ForkResult::Parent { child } => {
+            signal::store_child_pid(child.as_raw());
+            debug!("child pid = {}", child.as_raw());
+            let exitcode = wait_for_pid(child.as_raw())?;
+            debug!("[pid {}] exitcode = {exitcode}", child.as_raw());
+            debug!("reaping children of supervisor!");
+            reap_children()?;
+            unsafe { libc::_exit(exitcode) }
+        }
+        ForkResult::Child => {}
     }
 
     if let Err(e) = unsafe { signal::reset_child_signal_handlers() } {
@@ -437,7 +436,7 @@ impl CreateRequest {
         let mut rootfs = self
             .rootfs
             .clone()
-            .expect("expected rootfs to be configured");
+            .ok_or_else(|| anyhow!("expected rootfs to be configured"))?;
 
         let rootfs_readonly = self.rootfs_readonly.unwrap_or(false);
 
@@ -459,7 +458,7 @@ impl CreateRequest {
 
         oldroot
             .mount()
-            .expect("failed to unshare / in new mount namespace");
+            .map_err(|e| anyhow!("failed to unshare / in new mount namespace: {e}"))?;
 
         // If we want to clone the VFS root, e.g. for styrojail,
         // we have to do some special things to cope with that.
@@ -481,10 +480,14 @@ impl CreateRequest {
                 read_only: false,
                 data: None,
             };
-            stage_tmpfs.mount().expect("failed to mount staging tmpfs");
+            stage_tmpfs
+                .mount()
+                .map_err(|e| anyhow!("failed to mount staging tmpfs: {e}"))?;
 
-            std::fs::create_dir_all(&stage_root).expect("failed to create staging root dir");
-            std::fs::create_dir_all(&stage_old).expect("failed to create staging old dir");
+            fs::create_dir_all(&stage_root)
+                .map_err(|e| anyhow!("failed to create staging root dir: {e}"))?;
+            fs::create_dir_all(&stage_old)
+                .map_err(|e| anyhow!("failed to create staging old dir: {e}"))?;
 
             let stage_bind = MountSpec {
                 source: Some("/".to_string()),
@@ -500,7 +503,7 @@ impl CreateRequest {
             };
             stage_bind
                 .mount()
-                .expect("failed to bind / into staging root");
+                .map_err(|e| anyhow!("failed to bind / into staging root: {e}"))?;
 
             rootfs = stage_root.to_string();
         }
@@ -519,7 +522,9 @@ impl CreateRequest {
             data: None,
         };
 
-        newroot.mount().expect("failed to bind new rootfs");
+        newroot
+            .mount()
+            .map_err(|e| anyhow!("failed to bind new rootfs: {e}"))?;
 
         // Harden rootfs: add NOSUID + NODEV without NOEXEC (binaries must execute).
         // The `safe` flag on MountSpec adds all three, so we use mount_setattr directly.
@@ -536,7 +541,9 @@ impl CreateRequest {
         }
 
         if rootfs_readonly {
-            newroot.seal().expect("failed to make new rootfs readonly");
+            newroot
+                .seal()
+                .map_err(|e| anyhow!("failed to make new rootfs readonly: {e}"))?;
         }
 
         // Mount /proc.
@@ -553,7 +560,9 @@ impl CreateRequest {
             data: None,
         };
 
-        procfs.mount().expect("failed to mount /proc");
+        procfs
+            .mount()
+            .map_err(|e| anyhow!("failed to mount /proc: {e}"))?;
 
         if let Some(mounts) = &self.mounts {
             for mount in mounts {
@@ -578,7 +587,9 @@ impl CreateRequest {
                     );
                     // Only fatal for essential mounts (tmpfs /dev hides hvc0).
                     if mount.target == "/dev" && !mount.bind {
-                        return Err(e.context("essential mount /dev failed"));
+                        return Err(anyhow!(
+                            "failed to process essential mount spec {parented_target}: {e}"
+                        ));
                     }
                 }
             }
@@ -588,13 +599,16 @@ impl CreateRequest {
             for mutation in mutations {
                 match mutation {
                     Mutation::CreateDir(cdm) => {
-                        cdm.mutate(&rootfs).expect("failed to create directory");
+                        cdm.mutate(&rootfs)
+                            .map_err(|e| anyhow!("failed to create directory: {e}"))?;
                     }
                 };
             }
         }
 
-        newroot.pivot().expect("failed to pivot to new rootfs");
+        newroot
+            .pivot()
+            .map_err(|e| anyhow!("failed to pivot to new rootfs: {e}"))?;
 
         Ok(())
     }
@@ -673,45 +687,56 @@ impl Wrappable for CreateRequest {
 
         debug!("all namespaces unshared -- forking child");
         create_diag("styrolite: about to fork initial workload child");
-        let parent_efd = unsafe { libc::eventfd(0, libc::EFD_SEMAPHORE | libc::EFD_CLOEXEC) };
-        let child_efd = unsafe { libc::eventfd(0, libc::EFD_SEMAPHORE | libc::EFD_CLOEXEC) };
-        let pid = unsafe { libc::fork() };
-        if pid > 0 {
-            signal::store_child_pid(pid);
-            create_diag(&format!(
-                "styrolite: supervisor forked workload child pid={pid}"
-            ));
+        let parent_efd = EventFd::from_value_and_flags(0, EfdFlags::EFD_SEMAPHORE)?;
+        let child_efd = EventFd::from_value_and_flags(0, EfdFlags::EFD_SEMAPHORE)?;
+        match unsafe { fork() }? {
+            ForkResult::Parent { child } => {
+                signal::store_child_pid(child.as_raw());
+                create_diag(&format!(
+                    "styrolite: supervisor forked workload child pid={}",
+                    child.as_raw()
+                ));
 
-            if let Err(e) = self.report_workload_pid(pid) {
-                warn!("unable to report initial workload pid {pid}: {e}");
-            } else {
-                create_diag(&format!("styrolite: reported workload pid={pid}"));
+                if let Err(e) = self.report_workload_pid(child.as_raw()) {
+                    warn!(
+                        "unable to report initial workload pid {}: {e}",
+                        child.as_raw()
+                    );
+                } else {
+                    create_diag(&format!("styrolite: reported workload pid={}", child.as_raw()));
+                }
+
+                debug!("child pid = {}", child.as_raw());
+                parent_efd.read()?;
+
+                if target_ns.contains(&Namespace::User) {
+                    debug!("child has dropped into its own userns, configuring from supervisor");
+                    // In the two-stage path, the child calls pivot_fs() before signaling.
+                    // pivot_root() changes /proc for the parent too.
+                    // If a PID namespace was created, the new /proc shows the child as PID 1
+                    // (not its host PID), so we must use 1 to find it in /proc.
+                    // Without a PID namespace, the new proc mount still shows global PIDs.
+                    let userns_pid =
+                        if !skip_two_stage_userns && target_ns.contains(&Namespace::Pid) {
+                            1
+                        } else {
+                            child.as_raw()
+                        };
+                    self.prepare_userns(userns_pid)?;
+                }
+
+                // The supervisor has now configured the user namespace, so let the first process run.
+                child_efd.write(1)?;
+
+                let exitcode = wait_for_pid(child.as_raw())?;
+                debug!("[pid {}] exitcode = {exitcode}", child.as_raw());
+
+                debug!("reaping children of supervisor!");
+                reap_children()?;
+
+                unsafe { libc::_exit(exitcode) }
             }
-
-            debug!("child pid = {pid}");
-            let mut pef = unsafe { File::from_raw_fd(parent_efd) };
-            debug!("parent efd = {parent_efd}");
-            debug!("child efd = {child_efd}");
-            let mut buf = [0u8; 8];
-            pef.read_exact(&mut buf)?;
-
-            if target_ns.contains(&Namespace::User) {
-                debug!("child has dropped into its own userns, configuring from supervisor");
-                self.prepare_userns(pid)?;
-            }
-
-            // The supervisor has now configured the user namespace, so let the first process run.
-            let mut cef = unsafe { File::from_raw_fd(child_efd) };
-            cef.write_all(&1_u64.to_ne_bytes())?;
-
-            let exitcode = wait_for_pid(pid)?;
-            debug!("[pid {pid}] exitcode = {exitcode}");
-
-            debug!("reaping children of supervisor!");
-            reap_children()?;
-
-            // Use _exit to avoid running destructors/flushing buffers in forked process.
-            unsafe { libc::_exit(exitcode) }
+            ForkResult::Child => {}
         }
 
         close_optional_fd(self.workload_pid_report_fd);
@@ -721,32 +746,47 @@ impl Wrappable for CreateRequest {
             unsafe { libc::_exit(1) }
         }
 
-        let mut pef = unsafe { File::from_raw_fd(parent_efd) };
+        if !skip_two_stage_userns {
+            // The mount namespace was unshared in the parent under the initial user
+            // namespace context. Mount operations must happen before we enter the new
+            // user namespace, otherwise the child's user namespace won't own the mount
+            // namespace and operations on it will fail with EPERM.
+            if target_ns.contains(&Namespace::Mount) {
+                self.pivot_fs()?;
+            } else {
+                warn!(
+                    "mount namespace not present in requested namespaces, trying to work anyway..."
+                );
+                warn!("this is an insecure configuration!");
+            }
 
-        if !skip_two_stage_userns && target_ns.contains(&Namespace::User) {
-            debug!("unsharing user namespace");
-            unshare(&vec![Namespace::User])?;
+            if target_ns.contains(&Namespace::User) {
+                debug!("unsharing user namespace");
+                unshare(&vec![Namespace::User])?;
+            }
         }
         create_diag("styrolite: inner child waiting for supervisor handshake");
 
         debug!("signalling supervisor to do configuration");
-        pef.write_all(&2_u64.to_ne_bytes())?;
-        pef.flush()?;
+        parent_efd.write(2)?;
 
         // Wait for completion from the supervisor before launching the initial process
         // for this container.
-        let mut cef = unsafe { File::from_raw_fd(child_efd) };
-        let mut buf = [0u8; 8];
-        cef.read_exact(&mut buf)?;
+        child_efd.read()?;
         create_diag("styrolite: inner child handshake complete");
 
-        // We are configured, now do the mount stuff?
-        if target_ns.contains(&Namespace::Mount) {
-            self.pivot_fs()?;
+        if skip_two_stage_userns {
+            // In two-stage mode, mounts are deferred until after
+            // UID/GID namespace has been configured by the supervisor.
+            if target_ns.contains(&Namespace::Mount) {
+                self.pivot_fs()?;
+            } else {
+                warn!(
+                    "mount namespace not present in requested namespaces, trying to work anyway..."
+                );
+                warn!("this is an insecure configuration!");
+            }
             create_diag("styrolite: pivot_fs complete");
-        } else {
-            warn!("mount namespace not present in requested namespaces, trying to work anyway...");
-            warn!("this is an insecure configuration!");
         }
 
         debug!("mount tree finalized, doing final prep");
@@ -1092,4 +1132,168 @@ fn apply_capabilities(capabilities: Option<&Capabilities>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::CreateRequest;
+    use crate::namespace::Namespace;
+    use crate::unshare::unshare;
+    use nix::sys::wait::{WaitStatus, waitpid};
+    use nix::unistd::{ForkResult, fork, geteuid};
+
+    /// Run a closure in a forked child. Returns true if the child exits 0.
+    /// Uses _exit() to skip Rust destructors in the child.
+    unsafe fn in_child<F: FnOnce() -> i32>(f: F) -> bool {
+        match unsafe { fork() }.expect("fork failed") {
+            ForkResult::Child => unsafe { libc::_exit(f()) },
+            ForkResult::Parent { child } => matches!(
+                waitpid(child, None).expect("waitpid failed"),
+                WaitStatus::Exited(_, 0)
+            ),
+        }
+    }
+
+    fn is_root() -> bool {
+        geteuid().is_root()
+    }
+
+    /// Create a minimal rootfs with a /proc mountpoint for pivot_fs() tests.
+    /// Returns the TempDir so the caller keeps it alive. Children use _exit()
+    /// and never run its destructor; the parent drops it after waitpid().
+    fn make_minimal_rootfs() -> Option<tempfile::TempDir> {
+        let dir = tempfile::TempDir::new().ok()?;
+        std::fs::create_dir_all(dir.path().join("proc")).ok()?;
+        Some(dir)
+    }
+
+    fn request_with_rootfs(dir: &tempfile::TempDir) -> CreateRequest {
+        CreateRequest {
+            rootfs: Some(dir.path().to_string_lossy().into_owned()),
+            workload_id: Some("test".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Two-stage path (skip_two_stage_userns=false): mount namespace is unshared
+    /// in the initial user namespace context (root). pivot_fs() must succeed BEFORE
+    /// entering the new user namespace, because the mount namespace is owned by
+    /// the initial user namespace.
+    ///
+    /// Root-only: creating a mount namespace in the initial user namespace context
+    /// requires CAP_SYS_ADMIN there. An unprivileged user namespace unshare followed
+    /// by a mount namespace unshare results in locked mounts (propagation can't be
+    /// changed), which is a different and incompatible scenario.
+    #[test]
+    fn root_only_two_stage_pivot_fs_before_user_ns_succeeds() {
+        if !is_root() {
+            return;
+        }
+        assert!(unsafe {
+            in_child(|| {
+                let Some(rootfs_dir) = make_minimal_rootfs() else {
+                    return 1;
+                };
+                let req = request_with_rootfs(&rootfs_dir);
+                if unshare(&[Namespace::Mount]).is_err() {
+                    return 2;
+                }
+                if req.pivot_fs().is_err() {
+                    return 3;
+                }
+                if unshare(&[Namespace::User]).is_err() {
+                    return 4;
+                }
+                0
+            })
+        });
+    }
+
+    /// Regression test: pivot_fs() called after entering the new user namespace
+    /// fails with EPERM — the mount namespace is owned by the initial user namespace,
+    /// not the new one, so mount operations require CAP_SYS_ADMIN in the wrong ns.
+    ///
+    /// Root-only: same reasoning as two_stage_pivot_fs_before_user_ns_succeeds.
+    #[test]
+    fn root_only_two_stage_pivot_fs_after_user_ns_fails() {
+        if !is_root() {
+            return;
+        }
+        assert!(unsafe {
+            in_child(|| {
+                let Some(rootfs_dir) = make_minimal_rootfs() else {
+                    return 1;
+                };
+                let req = request_with_rootfs(&rootfs_dir);
+                if unshare(&[Namespace::Mount]).is_err() {
+                    return 1;
+                }
+                if unshare(&[Namespace::User]).is_err() {
+                    return 1;
+                }
+                // pivot_fs after user ns must fail
+                if req.pivot_fs().is_ok() { 1 } else { 0 }
+            })
+        });
+    }
+
+    /// Skip-two-stage path (skip_two_stage_userns=true): all namespaces unshared
+    /// together atomically, so the user namespace owns the mount and pid namespaces
+    /// from creation (mounts are not locked). The forked child (PID 1 in the new
+    /// pid namespace) calls pivot_fs() and it must succeed.
+    #[test]
+    fn root_only_skip_two_stage_pivot_fs_succeeds() {
+        if !is_root() {
+            return;
+        }
+        assert!(unsafe {
+            in_child(|| {
+                let Some(rootfs_dir) = make_minimal_rootfs() else {
+                    return 1;
+                };
+                let req = request_with_rootfs(&rootfs_dir);
+                if unshare(&[Namespace::User, Namespace::Mount, Namespace::Pid]).is_err() {
+                    return 2;
+                }
+                // Fork so the child enters the new pid namespace as PID 1.
+                // proc mount in pivot_fs() requires being inside the owned pid namespace.
+                let child = match fork() {
+                    Ok(ForkResult::Child) => {
+                        libc::_exit(if req.pivot_fs().is_err() { 1 } else { 0 })
+                    }
+                    Ok(ForkResult::Parent { child }) => child,
+                    Err(_) => return 3,
+                };
+                match waitpid(child, None) {
+                    Ok(WaitStatus::Exited(_, 0)) => 0,
+                    _ => 4,
+                }
+            })
+        });
+    }
+
+    /// Mount-only namespace (no user namespace): pivot_fs() succeeds.
+    /// Root-only: creating a mount namespace without any user namespace requires
+    /// CAP_SYS_ADMIN in the initial user namespace.
+    #[test]
+    fn root_only_mount_only_ns_pivot_fs_succeeds() {
+        if !is_root() {
+            return;
+        }
+        assert!(unsafe {
+            in_child(|| {
+                let Some(rootfs_dir) = make_minimal_rootfs() else {
+                    return 1;
+                };
+                let req = request_with_rootfs(&rootfs_dir);
+                if unshare(&[Namespace::Mount]).is_err() {
+                    return 2;
+                }
+                if req.pivot_fs().is_err() {
+                    return 3;
+                }
+                0
+            })
+        });
+    }
 }

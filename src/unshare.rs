@@ -1,4 +1,5 @@
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use anyhow::Result;
 use libc;
@@ -19,7 +20,7 @@ pub fn unshare<'x>(iter: impl IntoIterator<Item = &'x Namespace>) -> Result<()> 
 }
 
 /// A simple wrapper around the pidfd_open(2) syscall.
-pub fn pidfd_open(target_pid: libc::pid_t) -> Result<libc::c_int> {
+pub fn pidfd_open(target_pid: libc::pid_t) -> Result<OwnedFd> {
     let flags: libc::c_uint = 0;
 
     unsafe {
@@ -28,7 +29,7 @@ pub fn pidfd_open(target_pid: libc::pid_t) -> Result<libc::c_int> {
         if result < 0 {
             Err(io::Error::last_os_error().into())
         } else {
-            Ok(result as libc::c_int)
+            Ok(OwnedFd::from_raw_fd(result as libc::c_int))
         }
     }
 }
@@ -44,16 +45,11 @@ pub fn setns<'x>(
     let flags = iter.into_iter().fold(0, |acc, x| acc | to_clone_flags(*x));
     let pid_fd = pidfd_open(target_pid)?;
 
-    let result = unsafe {
-        if libc::setns(pid_fd, flags) < 0 {
+    unsafe {
+        if libc::setns(pid_fd.as_raw_fd(), flags) < 0 {
             Err(io::Error::last_os_error().into())
         } else {
             Ok(())
         }
-    };
-    // Always close pidfd regardless of setns result.
-    unsafe {
-        libc::close(pid_fd);
     }
-    result
 }
