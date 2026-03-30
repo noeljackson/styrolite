@@ -17,3 +17,6 @@ provide physical redundancy for scenarios where a medical quarantine
 field could fail.
 
    [st]: https://memory-alpha.fandom.com/wiki/Styrolite
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the fork workflow used to
+track downstream integration work and upstreamable patches.
